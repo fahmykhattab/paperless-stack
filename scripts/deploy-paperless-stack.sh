@@ -83,29 +83,52 @@ generate_hex_key() {
 
 # Detect Ollama host
 detect_ollama_host() {
+    # If explicitly set, use that
     if [[ -n "$OLLAMA_HOST" ]]; then
         echo "$OLLAMA_HOST"
         return
     fi
     
-    # Try common locations
-    local host_ip=""
+    local detected_host=""
     
-    # Check if Ollama is running locally
-    if curl -s http://localhost:11434/api/tags >/dev/null 2>&1; then
-        host_ip=$(ip route | grep default | awk '{print $3}' 2>/dev/null || echo "host.docker.internal")
-        echo "http://${host_ip}:11434"
+    # Method 1: Check if Ollama is running locally (same machine)
+    if curl -s --connect-timeout 2 http://localhost:11434/api/tags >/dev/null 2>&1; then
+        # Ollama is local - use Docker gateway for container access
+        local gateway=$(ip route show default | awk '/default/ {print $3}' 2>/dev/null)
+        if [[ -n "$gateway" ]]; then
+            log_info "Ollama detected locally, using Docker gateway: http://${gateway}:11434"
+            echo "http://${gateway}:11434"
+            return
+        fi
+    fi
+    
+    # Method 2: Try common Proxmox/home server IPs
+    local common_ips=(
+        "192.168.178.38"   # Common Proxmox host
+        "192.168.1.1"      # Common router
+        "192.168.0.1"
+        "10.0.0.1"
+    )
+    
+    for ip in "${common_ips[@]}"; do
+        if curl -s --connect-timeout 1 "http://${ip}:11434/api/tags" >/dev/null 2>&1; then
+            log_info "Ollama detected at: http://${ip}:11434"
+            echo "http://${ip}:11434"
+            return
+        fi
+    done
+    
+    # Method 3: Try Docker gateway IP
+    local gateway=$(ip route show default | awk '/default/ {print $3}' 2>/dev/null)
+    if [[ -n "$gateway" ]] && curl -s --connect-timeout 1 "http://${gateway}:11434/api/tags" >/dev/null 2>&1; then
+        log_info "Ollama detected at Docker gateway: http://${gateway}:11434"
+        echo "http://${gateway}:11434"
         return
     fi
     
-    # Try Docker gateway IP (for Linux)
-    host_ip=$(ip route show default | awk '/default/ {print $3}' 2>/dev/null)
-    if [[ -n "$host_ip" ]] && curl -s "http://${host_ip}:11434/api/tags" >/dev/null 2>&1; then
-        echo "http://${host_ip}:11434"
-        return
-    fi
-    
-    # Default fallback
+    # Fallback: Use host.docker.internal (works on macOS/Windows, needs extra_hosts on Linux)
+    log_warn "Could not auto-detect Ollama. Using host.docker.internal as fallback."
+    log_warn "If Ollama is on a different host, set OLLAMA_HOST environment variable."
     echo "http://host.docker.internal:11434"
 }
 
@@ -136,6 +159,53 @@ check_prerequisites() {
     if ! docker compose version &>/dev/null; then
         log_error "Docker Compose not available. Please install Docker Compose."
         exit 1
+    fi
+    
+    # Install required dependencies
+    local need_install=()
+    
+    if ! command -v jq &>/dev/null; then
+        need_install+=(jq)
+    fi
+    
+    if ! command -v redis-cli &>/dev/null; then
+        # redis-cli is part of redis-tools or redis on most distros
+        if command -v apt-get &>/dev/null; then
+            need_install+=(redis-tools)
+        elif command -v dnf &>/dev/null; then
+            need_install+=(redis)
+        elif command -v yum &>/dev/null; then
+            need_install+=(redis)
+        fi
+    fi
+    
+    if [[ ${#need_install[@]} -gt 0 ]]; then
+        log_warn "Installing missing dependencies: ${need_install[*]}"
+        if command -v apt-get &>/dev/null; then
+            apt-get update && apt-get install -y "${need_install[@]}"
+        elif command -v dnf &>/dev/null; then
+            dnf install -y "${need_install[@]}"
+        elif command -v yum &>/dev/null; then
+            yum install -y "${need_install[@]}"
+        else
+            log_error "Package manager not supported. Please install: ${need_install[*]}"
+            exit 1
+        fi
+        log_success "Dependencies installed"
+    fi
+    
+    # Check minimum disk space (25GB recommended)
+    local available_gb=$(df -BG / | awk 'NR==2 {gsub(/G/,"",$4); print $4}')
+    if [[ "$available_gb" -lt 25 ]]; then
+        log_warn "Low disk space: ${available_gb}GB available. Recommend at least 25GB for Paperless stack."
+        log_warn "Model downloads (qwen3-vl ~4.3GB) and Docker images require significant space."
+    fi
+    
+    # Warn if OLLAMA_HOST not set and detection may fail
+    if [[ -z "$OLLAMA_HOST" ]]; then
+        log_info "OLLAMA_HOST not set. Will attempt auto-detection."
+        log_info "If Ollama is not on this host, set OLLAMA_HOST environment variable:"
+        log_info "  Example: OLLAMA_HOST=http://192.168.178.38:11434 ./deploy-paperless-stack.sh"
     fi
     
     log_success "Prerequisites OK"
