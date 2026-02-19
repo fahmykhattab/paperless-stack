@@ -53,32 +53,26 @@ log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
 generate_random_string() {
     local length="${1:-32}"
-    # Use openssl if available (more reliable), fallback to /dev/urandom
+    # Temporarily disable pipefail to avoid SIGPIPE from head
+    set +o pipefail
     if command -v openssl &>/dev/null; then
         openssl rand -base64 $((length * 2)) 2>/dev/null | tr -dc 'a-zA-Z0-9' | head -c "$length"
     else
-        # Fallback: read from urandom in chunks to avoid SIGPIPE
-        local result=""
-        while [[ ${#result} -lt "$length" ]]; do
-            result+=$(head -c 256 /dev/urandom | tr -dc 'a-zA-Z0-9' 2>/dev/null || true)
-        done
-        echo "${result:0:$length}"
+        tr -dc 'a-zA-Z0-9' < /dev/urandom | fold -w "$length" | head -n 1
     fi
+    set -o pipefail
 }
 
 generate_hex_key() {
     local length="${1:-64}"
-    # Use openssl if available (more reliable)
+    # Temporarily disable pipefail to avoid SIGPIPE from head
+    set +o pipefail
     if command -v openssl &>/dev/null; then
         openssl rand -hex "$((length / 2))" 2>/dev/null | head -c "$length"
     else
-        # Fallback: read from urandom in chunks to avoid SIGPIPE
-        local result=""
-        while [[ ${#result} -lt "$length" ]]; do
-            result+=$(head -c 256 /dev/urandom | tr -dc 'a-f0-9' 2>/dev/null || true)
-        done
-        echo "${result:0:$length}"
+        tr -dc 'a-f0-9' < /dev/urandom | fold -w "$length" | head -n 1
     fi
+    set -o pipefail
 }
 
 # Detect Ollama host
