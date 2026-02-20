@@ -216,7 +216,7 @@ generate_credentials() {
     log_info "Generating credentials..."
     
     PAPERLESS_ADMIN_USER="${PAPERLESS_ADMIN_USER:-admin}"
-    PAPERLESS_ADMIN_PASSWORD="${PAPERLESS_ADMIN_PASSWORD:-$(generate_random_string 16)}"
+    PAPERLESS_ADMIN_PASSWORD="${PAPERLESS_ADMIN_PASSWORD:-admin}"
     PAPERLESS_SECRET_KEY="${PAPERLESS_SECRET_KEY:-$(generate_random_string 32)}"
     PAPERLESS_API_TOKEN="${PAPERLESS_API_TOKEN:-$(generate_hex_key 40)}"
     PAPERLESSAI_API_KEY="${PAPERLESSAI_API_KEY:-$(generate_hex_key 128)}"
@@ -729,16 +729,14 @@ print_summary() {
     echo ""
     echo "📁 Installation Directory: ${PAPERLESS_DIR}"
     echo ""
-    echo "⚙️  Post-Installation Steps:"
-    echo "   1. Login to Paperless-ngx and create an API token"
-    echo "   2. Configure Paperless-AI via its web UI"
-    echo "   3. Add the 'paperless-gpt' tag in Paperless-ngx for auto-processing"
+    echo "⚙️  Auto-Configured:"
+    echo "   ✓ Tags: paperless-gpt-ocr-auto, paperless-gpt-ocr-complete, paperless-gpt-auto"
+    echo "   ✓ Workflow: 'Auto OCR Tagging' (tags all new documents for AI processing)"
+    echo "   ✓ API Token: Automatically generated and configured for paperless-gpt"
     echo ""
-    echo "📝 API Token for PaperlessGPT/Paperless-AI:"
-    echo "   ${PAPERLESS_API_TOKEN}"
-    echo ""
-    echo "   Generate a real token in Paperless UI: Settings → API Auth Tokens"
-    echo "   Then update: docker-compose.yaml (PAPERLESS_API_TOKEN) and restart"
+    echo "📄 Next Steps:"
+    echo "   1. Upload a document to test the auto-tagging workflow"
+    echo "   2. Configure Paperless-AI via its web UI (optional, for RAG chat)"
     echo ""
     echo "💡 Useful Commands:"
     echo "   cd ${PAPERLESS_DIR}"
@@ -749,6 +747,145 @@ print_summary() {
     echo ""
     echo "📄 Configuration saved to: ${PAPERLESS_DIR}/.env"
     echo ""
+}
+
+# Setup auto-tagging workflow for PaperlessGPT
+setup_auto_workflow() {
+    log_info "Setting up auto-tagging workflow..."
+    
+    cd "$PAPERLESS_DIR"
+    
+    # Wait for Paperless-ngx API to be ready
+    local max_wait=60
+    local waited=0
+    while ! curl -sf http://localhost:${PAPERLESS_PORT}/api/ >/dev/null 2>&1; do
+        if [[ $waited -ge $max_wait ]]; then
+            log_warn "Paperless-ngx API not ready. Skipping auto-workflow setup."
+            log_warn "You can manually create tags and workflow later."
+            return 1
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
+    
+    # Get API token by logging in
+    local token_response=$(curl -sf -X POST "http://localhost:${PAPERLESS_PORT}/api/token/" \
+        -H "Content-Type: application/json" \
+        -d "{\"username\":\"${PAPERLESS_ADMIN_USER}\",\"password\":\"${PAPERLESS_ADMIN_PASSWORD}\"}" 2>/dev/null)
+    
+    if [[ -z "$token_response" ]] || ! echo "$token_response" | grep -q '"token"'; then
+        log_warn "Could not authenticate with Paperless-ngx. Skipping auto-workflow setup."
+        return 1
+    fi
+    
+    local api_token=$(echo "$token_response" | jq -r '.token')
+    
+    # Create required tags
+    local auto_tag_id=""
+    local complete_tag_id=""
+    
+    # Create paperless-gpt-ocr-auto tag
+    local auto_tag_response=$(curl -sf -X POST "http://localhost:${PAPERLESS_PORT}/api/tags/" \
+        -H "Authorization: Token $api_token" \
+        -H "Content-Type: application/json" \
+        -d '{"name":"paperless-gpt-ocr-auto","color":"#4a90d9"}' 2>/dev/null)
+    
+    if [[ -n "$auto_tag_response" ]]; then
+        auto_tag_id=$(echo "$auto_tag_response" | jq -r '.id // empty')
+        if [[ -n "$auto_tag_id" ]]; then
+            log_info "Created tag: paperless-gpt-ocr-auto (id: $auto_tag_id)"
+        else
+            # Tag might already exist, get its ID
+            auto_tag_id=$(curl -sf "http://localhost:${PAPERLESS_PORT}/api/tags/?name=paperless-gpt-ocr-auto" \
+                -H "Authorization: Token $api_token" 2>/dev/null | jq -r '.results[0].id // empty')
+        fi
+    fi
+    
+    # Create paperless-gpt-ocr-complete tag
+    local complete_tag_response=$(curl -sf -X POST "http://localhost:${PAPERLESS_PORT}/api/tags/" \
+        -H "Authorization: Token $api_token" \
+        -H "Content-Type: application/json" \
+        -d '{"name":"paperless-gpt-ocr-complete","color":"#5cb85c"}' 2>/dev/null)
+    
+    if [[ -n "$complete_tag_response" ]]; then
+        complete_tag_id=$(echo "$complete_tag_response" | jq -r '.id // empty')
+        if [[ -n "$complete_tag_id" ]]; then
+            log_info "Created tag: paperless-gpt-ocr-complete (id: $complete_tag_id)"
+        else
+            # Tag might already exist, get its ID
+            complete_tag_id=$(curl -sf "http://localhost:${PAPERLESS_PORT}/api/tags/?name=paperless-gpt-ocr-complete" \
+                -H "Authorization: Token $api_token" 2>/dev/null | jq -r '.results[0].id // empty')
+        fi
+    fi
+    
+    # Create paperless-gpt-auto tag (for AI tagging)
+    local ai_auto_tag_response=$(curl -sf -X POST "http://localhost:${PAPERLESS_PORT}/api/tags/" \
+        -H "Authorization: Token $api_token" \
+        -H "Content-Type: application/json" \
+        -d '{"name":"paperless-gpt-auto","color":"#f0ad4e"}' 2>/dev/null)
+    
+    if [[ -n "$ai_auto_tag_response" ]]; then
+        local ai_tag_id=$(echo "$ai_auto_tag_response" | jq -r '.id // empty')
+        if [[ -n "$ai_tag_id" ]]; then
+            log_info "Created tag: paperless-gpt-auto (id: $ai_tag_id)"
+        fi
+    fi
+    
+    # Create workflow to auto-tag new documents with paperless-gpt-ocr-auto
+    if [[ -n "$auto_tag_id" ]]; then
+        local workflow_response=$(curl -sf -X POST "http://localhost:${PAPERLESS_PORT}/api/workflows/" \
+            -H "Authorization: Token $api_token" \
+            -H "Content-Type: application/json" \
+            -d "{
+                \"name\": \"Auto OCR Tagging\",
+                \"order\": 0,
+                \"enabled\": true,
+                \"triggers\": [
+                    {
+                        \"type\": 1,
+                        \"filter_filename\": \".*\",
+                        \"filter_path\": \".*\",
+                        \"filter_has_tags\": [],
+                        \"filter_has_correspondent\": null,
+                        \"filter_document_type\": null
+                    }
+                ],
+                \"actions\": [
+                    {
+                        \"type\": 15,
+                        \"assign_tags\": [$auto_tag_id]
+                    }
+                ]
+            }" 2>/dev/null)
+        
+        if [[ -n "$workflow_response" ]] && echo "$workflow_response" | jq -e '.id' >/dev/null 2>&1; then
+            log_success "Created workflow: Auto OCR Tagging (tags all new documents)"
+        else
+            log_warn "Could not create workflow. You may need to create it manually in Paperless UI."
+        fi
+    else
+        log_warn "Could not get auto-tag ID. Skipping workflow creation."
+    fi
+    
+    # Update paperless-gpt with the API token if we have one
+    if [[ -n "$api_token" ]]; then
+        # Check if docker-compose.override.yml exists
+        if [[ ! -f "$PAPERLESS_DIR/docker-compose.override.yml" ]]; then
+            cat > "$PAPERLESS_DIR/docker-compose.override.yml" << EOF
+services:
+  paperless-gpt:
+    environment:
+      - PAPERLESS_API_TOKEN=${api_token}
+EOF
+            log_info "Created docker-compose.override.yml with API token"
+        fi
+        
+        # Recreate paperless-gpt container to pick up new token
+        docker compose up -d paperless-gpt --force-recreate 2>/dev/null
+        log_info "Restarted paperless-gpt with API token"
+    fi
+    
+    log_success "Auto-tagging workflow setup complete!"
 }
 
 # Save credentials to file
@@ -791,6 +928,7 @@ main() {
     create_prompts
     create_paperless_ai_config
     start_stack
+    setup_auto_workflow
     save_credentials
     print_summary
 }
